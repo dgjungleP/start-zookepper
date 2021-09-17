@@ -36,7 +36,7 @@ public class AdminClient extends DefaultWatcher {
             System.out.println("\t" + child + ": " + stat);
         }
         System.out.println("Tasks:");
-        for (String task : zk.getChildren("/tasks", false)) {
+        for (String task : zk.getChildren("/assign", false)) {
             System.out.println("\t" + task);
         }
     }
