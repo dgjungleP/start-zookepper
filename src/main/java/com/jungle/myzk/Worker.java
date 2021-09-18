@@ -1,6 +1,9 @@
 package com.jungle.myzk;
 
-import org.apache.zookeeper.*;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.Stat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,8 +14,7 @@ import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
-import static org.apache.zookeeper.AsyncCallback.*;
-import static org.apache.zookeeper.AsyncCallback.DataCallback;
+import static org.apache.zookeeper.AsyncCallback.StatCallback;
 import static org.apache.zookeeper.AsyncCallback.StringCallback;
 import static org.apache.zookeeper.KeeperException.Code;
 
@@ -76,6 +78,6 @@ public class Worker extends DefaultWatcher {
         Worker worker = new Worker(args[0]);
         worker.startZK();
         worker.register();
-        Thread.sleep(30000);
+        TimeUnit.SECONDS.sleep(10000);
     }
 }

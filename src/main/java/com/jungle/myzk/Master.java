@@ -1,34 +1,117 @@
 package com.jungle.myzk;
 
 import javafx.concurrent.Worker;
-import org.apache.zookeeper.*;
-import org.apache.zookeeper.Watcher.Event.*;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.Event.EventType;
+import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.Stat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.zookeeper.AsyncCallback.*;
-import static org.apache.zookeeper.KeeperException.*;
+import static org.apache.zookeeper.KeeperException.Code;
+import static org.apache.zookeeper.ZooDefs.Ids;
 
 public class Master extends DefaultWatcher {
-    public static final Logger LOG = LoggerFactory.getLogger(Worker.class);
-    public static final String PATH = "/master";
+
+
     enum MasterStates {RUNNING, ELECTED, NOTELECTED;}
 
-    String serverId = Integer.toHexString(new Random().nextInt());
+
+    private final Random RANDOM = new Random();
+    public static final Logger LOG = LoggerFactory.getLogger(Worker.class);
+    public static final String PATH = "/master";
+    String serverId = Integer.toHexString(RANDOM.nextInt());
     volatile MasterStates state = MasterStates.RUNNING;
+    ChildrenCache workersCache;
+
+
+    private StringCallback assignTaskCallback = (rc, path, ctx, name) -> {
+        switch (Code.get(rc)) {
+            case CONNECTIONLOSS:
+                createAssignment(path, (byte[]) ctx);
+                break;
+            case OK:
+                LOG.info("Task assigned correctly: " + name);
+                deleteTask(name.substring(name.lastIndexOf("/") + 1));
+                break;
+            case NODEEXISTS:
+                LOG.warn("Task already assigned");
+                break;
+            default:
+                LOG.error("Error when trying to assign task.", KeeperException.create(Code.get(rc), path));
+        }
+    };
+    private DataCallback taskDataCallback = (rc, path, ctx, data, stat) -> {
+        switch (Code.get(rc)) {
+            case CONNECTIONLOSS:
+                getTaskData((String) ctx);
+                break;
+            case OK:
+                List<String> workersCacheList = workersCache.getList();
+                int worker = RANDOM.nextInt(workersCacheList.size());
+                String designatedWorker = workersCacheList.get(worker);
+
+                String assignmentPath = "/assign/" + designatedWorker + "/" + ctx;
+                createAssignment(assignmentPath, data);
+                break;
+            default:
+                LOG.error("Error when trying to get task data.", KeeperException.create(Code.get(rc), path));
+        }
+    };
+    private final ChildrenCallback workersGetChildrenCallback = (rc, path, ctx, children) -> {
+        switch (Code.get(rc)) {
+            case CONNECTIONLOSS:
+                getWorkers();
+                break;
+            case OK:
+                LOG.info("Successfully got a list of workers: " + children.size() + " workers");
+                reassignAndSet(children);
+                break;
+            default:
+                LOG.error("getChildren failed", KeeperException.create(Code.get(rc), path));
+        }
+    };
+    Watcher workersChangeWatcher = event -> {
+        if (event.getType().equals(EventType.NodeChildrenChanged)) {
+            assert "/workers".equals(event.getPath());
+            getWorkers();
+        }
+    };
+    private final ChildrenCallback tasksGetChildrenCallback = (rc, path, ctx, children) -> {
+        switch (Code.get(rc)) {
+            case CONNECTIONLOSS:
+                getTasks();
+                break;
+            case OK:
+                assignTasks(children);
+                break;
+            default:
+                LOG.error("getChildren failed", KeeperException.create(Code.get(rc), path));
+        }
+    };
+    Watcher tasksChangeWatcher = event -> {
+        if (event.getType().equals(EventType.NodeChildrenChanged)) {
+            assert "/tasks".equals(event.getPath());
+            getTasks();
+        }
+    };
     private final Watcher masterExistsWatcher = event -> {
         if (Objects.equals(event.getType(), EventType.NodeDeleted)) {
             assert PATH.equals(event.getPath());
             runForMaster();
         }
     };
-    private StatCallback masterExistsCallback = (int rc, String path, Object ctx, Stat stat) -> {
+    private final StatCallback masterExistsCallback = (int rc, String path, Object ctx, Stat stat) -> {
         switch (Code.get(rc)) {
             case CONNECTIONLOSS:
                 masterExists();
@@ -89,6 +172,37 @@ public class Master extends DefaultWatcher {
         }
     };
 
+
+    private void deleteTask(String path) {
+
+    }
+
+    private void createAssignment(String path, byte[] data) {
+        zk.create(path, data, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT, assignTaskCallback, data);
+    }
+
+    private void assignTasks(List<String> children) {
+        if (children == null) {
+            return;
+        }
+        for (String task : children) {
+            getTaskData(task);
+        }
+    }
+
+    private void getTaskData(String task) {
+        zk.getData("/tasks/" + task, false, taskDataCallback, task);
+    }
+
+
+    private void getTasks() {
+        zk.getChildren("/tasks", tasksChangeWatcher, tasksGetChildrenCallback, null);
+    }
+
+    private void getWorkers() {
+        zk.getChildren("/workers", workersChangeWatcher, workersGetChildrenCallback, null);
+    }
+
     public Master(String hostPort) {
         super(hostPort);
     }
@@ -101,6 +215,7 @@ public class Master extends DefaultWatcher {
     private void masterExists() {
         zk.exists(PATH, masterExistsWatcher, masterExistsCallback, null);
     }
+
     public void startZK() throws IOException {
         zk = new ZooKeeper(hostPort, 15000, this);
     }
@@ -109,13 +224,33 @@ public class Master extends DefaultWatcher {
         zk.close();
     }
 
+    private void reassignAndSet(List<String> children) {
+        List<String> toProcess;
+        if (workersCache == null) {
+            workersCache = new ChildrenCache(children);
+            toProcess = null;
+        } else {
+            LOG.info("Removing and setting");
+            toProcess = workersCache.removedAndSet(children);
+        }
+        if (toProcess != null) {
+            for (String worker : toProcess) {
+                getAbsentWorkerTasks(worker);
+            }
+        }
+    }
+
+    private void getAbsentWorkerTasks(String worker) {
+    }
+
+
     public MasterStates getState() {
         return state;
     }
 
     public void runForMaster() {
         zk.create(PATH, serverId.getBytes(StandardCharsets.UTF_8),
-                ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL, masterCreateCallback, null);
+                Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL, masterCreateCallback, null);
     }
 
     public void checkMaster() {
@@ -131,7 +266,7 @@ public class Master extends DefaultWatcher {
     }
 
     private void createParent(String path, byte[] data) {
-        zk.create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT,
+        zk.create(path, data, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT,
                 creatParentCallback, data);
     }
 
@@ -139,7 +274,7 @@ public class Master extends DefaultWatcher {
         Master master = new Master(args[0]);
         master.startZK();
         master.runForMaster();
-        Thread.sleep(60000);
+        TimeUnit.SECONDS.sleep(10000);
         master.stopZk();
     }
 }
